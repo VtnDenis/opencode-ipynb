@@ -1,4 +1,4 @@
-import type { ToolContext } from "@opencode-ai/plugin"
+import type { ToolContext } from "../v1compat.js"
 import { Effect } from "effect"
 import {
   PluginOptionsSchema,

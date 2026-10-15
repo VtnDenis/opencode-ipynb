@@ -1,4 +1,5 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
+import { z } from "zod"
 import { ipynbInspectTool } from "./tools/inspect.js"
 import { ipynbReadTool } from "./tools/read.js"
 import { ipynbEditTool } from "./tools/edit.js"
@@ -14,37 +15,99 @@ import { ipynbReproTool } from "./tools/repro.js"
 import { ipynbKernelTool } from "./tools/kernel.js"
 import { parsePluginOptions } from "./plugin-options.js"
 import { disposeSharedKernelManager } from "./services/index.js"
+import type { ToolContext as V1Context, ToolResult as V1Result, ToolDefinition } from "./v1compat.js"
 
-const plugin: Plugin = async (_input, options) => {
-  const parsed = parsePluginOptions(options)
-  if (parsed.pythonPath && !process.env.OPENCODE_IPYNB_PYTHON) {
-    process.env.OPENCODE_IPYNB_PYTHON = parsed.pythonPath
+type V2ToolOptions = {
+  readonly permission?: string
+}
+
+const toV2Result = (raw: V1Result): { content: ReadonlyArray<{ type: "text"; text: string } | { type: "file"; uri: string; mime: string; name?: string }>; metadata?: Record<string, unknown> } => {
+  if (typeof raw === "string") {
+    return { content: [{ type: "text" as const, text: raw }] }
   }
-  if (!process.env.OPENCODE_IPYNB_OPTIONS) {
-    process.env.OPENCODE_IPYNB_OPTIONS = JSON.stringify(parsed)
+  const content: Array<{ type: "text"; text: string } | { type: "file"; uri: string; mime: string; name?: string }> = [
+    { type: "text" as const, text: raw.output }
+  ]
+  for (const att of raw.attachments ?? []) {
+    content.push({
+      type: "file" as const,
+      uri: att.url,
+      mime: att.mime,
+      ...(att.filename === undefined ? {} : { name: att.filename })
+    })
   }
   return {
-    tool: {
-      ipynb_inspect: ipynbInspectTool,
-      ipynb_read: ipynbReadTool,
-      ipynb_edit: ipynbEditTool,
-      ipynb_cell_insert: ipynbCellInsertTool,
-      ipynb_cell_delete: ipynbCellDeleteTool,
-      ipynb_cell_move: ipynbCellMoveTool,
-      ipynb_run: ipynbRunTool,
-      ipynb_outputs: ipynbOutputsTool,
-      ipynb_clean: ipynbCleanTool,
-      ipynb_export: ipynbExportTool,
-      ipynb_doctor: ipynbDoctorTool,
-      ipynb_repro: ipynbReproTool,
-      ipynb_kernel: ipynbKernelTool
-    },
-    dispose: async () => {
+    content,
+    ...(raw.metadata === undefined ? {} : { metadata: raw.metadata })
+  }
+}
+
+const adapt = (
+  name: string,
+  v1: ToolDefinition,
+  env: { directory: string; worktree: string },
+  options?: V2ToolOptions
+) => {
+  return {
+    name,
+    description: v1.description,
+    // Zod v4 schemas implement StandardSchemaV1, accepted directly as V2 input.
+    input: z.object(v1.args),
+    ...(options?.permission === undefined ? {} : { options: { permission: options.permission } }),
+    execute: async (input: Record<string, unknown>, context: { sessionID: string; agent: string; messageID: string; signal: AbortSignal }) => {
+      const v1ctx: V1Context = {
+        sessionID: context.sessionID,
+        messageID: context.messageID,
+        agent: context.agent,
+        directory: env.directory,
+        worktree: env.worktree,
+        abort: context.signal,
+        metadata: () => {},
+        // V2 Promise tool executors have no interactive ask hook. Writes and
+        // executions proceed once the tool call itself is approved; use
+        // `permissions` config (actions ipynb_edit / ipynb_run / ...) to
+        // allow, ask, or deny per tool.
+        ask: async () => {}
+      }
+      const raw = await v1.execute(input as never, v1ctx)
+      return toV2Result(raw)
+    }
+  }
+}
+
+export default Plugin.define({
+  id: "opencode-ipynb",
+  async setup(ctx) {
+    const parsed = parsePluginOptions(ctx.options)
+    if (parsed.pythonPath && !process.env.OPENCODE_IPYNB_PYTHON) {
+      process.env.OPENCODE_IPYNB_PYTHON = parsed.pythonPath
+    }
+    if (!process.env.OPENCODE_IPYNB_OPTIONS) {
+      process.env.OPENCODE_IPYNB_OPTIONS = JSON.stringify(parsed)
+    }
+    const env = {
+      directory: ctx.location.directory,
+      worktree: ctx.location.project.canonical ?? ctx.location.project.directory ?? ctx.location.directory
+    }
+    await ctx.tool.transform((editor) => {
+      editor.add(adapt("ipynb_inspect", ipynbInspectTool, env) as never)
+      editor.add(adapt("ipynb_read", ipynbReadTool, env) as never)
+      editor.add(adapt("ipynb_edit", ipynbEditTool, env, { permission: "edit" }) as never)
+      editor.add(adapt("ipynb_cell_insert", ipynbCellInsertTool, env, { permission: "edit" }) as never)
+      editor.add(adapt("ipynb_cell_delete", ipynbCellDeleteTool, env, { permission: "edit" }) as never)
+      editor.add(adapt("ipynb_cell_move", ipynbCellMoveTool, env, { permission: "edit" }) as never)
+      editor.add(adapt("ipynb_run", ipynbRunTool, env, { permission: "shell" }) as never)
+      editor.add(adapt("ipynb_outputs", ipynbOutputsTool, env, { permission: "edit" }) as never)
+      editor.add(adapt("ipynb_clean", ipynbCleanTool, env, { permission: "edit" }) as never)
+      editor.add(adapt("ipynb_export", ipynbExportTool, env, { permission: "edit" }) as never)
+      editor.add(adapt("ipynb_doctor", ipynbDoctorTool, env) as never)
+      editor.add(adapt("ipynb_repro", ipynbReproTool, env) as never)
+      editor.add(adapt("ipynb_kernel", ipynbKernelTool, env, { permission: "edit" }) as never)
+    })
+    return async () => {
       // Kill every live warm kernel so we do not leave zombie Python
       // subprocesses when the OpenCode session ends.
       await disposeSharedKernelManager()
     }
   }
-}
-
-export default plugin
+})

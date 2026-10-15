@@ -12,7 +12,7 @@ import { formatCellMarkdownDetailed, type MarkdownReadOptions } from "../format/
 import type { CellRaw } from "../domain/cell.js"
 import { cellSource } from "../domain/notebook.js"
 import { DEFAULT_MAX_SOURCE_CHARS, DEFAULT_MAX_OUTPUT_CHARS } from "../utils/limits.js"
-import type { ToolAttachment } from "@opencode-ai/plugin"
+import type { ToolAttachment } from "../v1compat.js"
 
 export interface ReadRangeRequest {
   readonly cellIndex?: number | undefined

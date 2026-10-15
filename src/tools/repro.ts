@@ -1,7 +1,7 @@
 import { z } from "zod"
-import { tool } from "@opencode-ai/plugin"
+import { tool } from "../v1compat.js"
 import { Cause, Effect } from "effect"
-import type { ToolContext } from "@opencode-ai/plugin"
+import type { ToolContext } from "../v1compat.js"
 import { buildServices } from "../services/index.js"
 import {
   errorToMessage,

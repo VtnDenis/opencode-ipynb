@@ -1,4 +1,4 @@
-import type { ToolAttachment } from "@opencode-ai/plugin"
+import type { ToolAttachment } from "../v1compat.js"
 
 const EXTENSION_BY_MIME: Record<string, string> = {
   "image/png": "png",

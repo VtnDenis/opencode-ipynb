@@ -2,7 +2,7 @@ import { truncate } from "../utils/truncate.js"
 import { cellSource } from "../domain/notebook.js"
 import type { CellRaw, CodeCellRaw, MarkdownCellRaw, RawCellRaw } from "../domain/cell.js"
 import { formatOutputs, formatOutputsDetailed, type FormattedOutput, type OutputFormatOptions } from "./outputs.js"
-import type { ToolAttachment } from "@opencode-ai/plugin"
+import type { ToolAttachment } from "../v1compat.js"
 
 export interface MarkdownReadOptions {
   readonly includeOutputs: boolean

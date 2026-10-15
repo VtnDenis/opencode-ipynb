@@ -7,7 +7,7 @@ import type { CellRaw } from "../domain/cell.js"
 import type { NotebookRaw } from "../domain/notebook.js"
 import { cellSource } from "../domain/notebook.js"
 import { analyzeExecutionOrder } from "../services/NotebookInspectService.js"
-import type { ToolAttachment } from "@opencode-ai/plugin"
+import type { ToolAttachment } from "../v1compat.js"
 
 export interface OutputFormatOptions {
   readonly includeImages: boolean

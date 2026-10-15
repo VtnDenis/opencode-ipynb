@@ -1,5 +1,5 @@
 import { Context, Effect } from "effect"
-import type { ToolContext } from "@opencode-ai/plugin"
+import type { ToolContext } from "../v1compat.js"
 import { PermissionDeniedError } from "../domain/errors.js"
 
 export type PermissionKind = "edit" | "bash" | "read"
