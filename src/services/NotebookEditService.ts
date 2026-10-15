@@ -13,7 +13,7 @@ import { PathService, type PathServiceShape } from "./PathService.js"
 import { PermissionService, type PermissionServiceShape } from "./PermissionService.js"
 import { DiffService, type DiffServiceShape } from "./DiffService.js"
 import { cellSource, type NotebookRaw } from "../domain/notebook.js"
-import type { CellRaw, CodeCellRaw, MarkdownCellRaw, RawCellRaw } from "../domain/cell.js"
+import type { CellMetadata, CellRaw, CodeCellRaw, MarkdownCellRaw, RawCellRaw } from "../domain/cell.js"
 import { firstLine, truncatePreview } from "../utils/truncate.js"
 import { unwrapFiberFailure } from "../utils/fiber.js"
 
@@ -21,6 +21,8 @@ export interface EditRequest {
   readonly cellIndex: number
   readonly source: string
   readonly clearOutputs?: "auto" | "always" | "never"
+  readonly cellType?: CellType | undefined
+  readonly tags?: ReadonlyArray<string> | undefined
 }
 
 export interface EditResult {
@@ -28,6 +30,9 @@ export interface EditResult {
   readonly absPath: string
   readonly cellIndex: number
   readonly cellType: "code" | "markdown" | "raw"
+  readonly previousCellType: "code" | "markdown" | "raw"
+  readonly converted: boolean
+  readonly tags?: ReadonlyArray<string> | undefined
   readonly clearedOutputs: boolean
   readonly diff: string
   readonly oldPreview: string
@@ -166,6 +171,62 @@ const buildNewCell = (cellType: CellType, source: string): CellRaw => {
   return cell
 }
 
+/**
+ * Replace `metadata.tags` when `tags` is provided; an empty array removes the
+ * key entirely. Returns the original object otherwise so no-op edits keep the
+ * exact same metadata shape.
+ */
+const applyTags = (
+  metadata: CellMetadata,
+  tags: ReadonlyArray<string> | undefined
+): CellMetadata => {
+  if (tags === undefined) {
+    return metadata
+  }
+  const next: CellMetadata = { ...metadata }
+  if (tags.length === 0) {
+    delete next["tags"]
+    return next
+  }
+  next["tags"] = [...tags]
+  return next
+}
+
+/**
+ * Build a cell of `targetType` keeping the shared nbformat-safe fields (id,
+ * metadata, source). Outputs and execution_count cannot survive a type change:
+ * code -> markdown/raw drops them, anything -> code starts from the same empty
+ * state as a freshly inserted code cell.
+ */
+const convertCell = (
+  cell: CellRaw,
+  targetType: CellType,
+  source: string,
+  metadata: CellMetadata
+): CellRaw => {
+  const id = cell.id
+  const base = {
+    metadata,
+    source,
+    ...(id === undefined ? {} : { id })
+  }
+  if (targetType === "code") {
+    const code: CodeCellRaw = {
+      ...base,
+      cell_type: "code",
+      execution_count: null,
+      outputs: []
+    }
+    return code
+  }
+  if (targetType === "markdown") {
+    const markdown: MarkdownCellRaw = { ...base, cell_type: "markdown" }
+    return markdown
+  }
+  const raw: RawCellRaw = { ...base, cell_type: "raw" }
+  return raw
+}
+
 const makeEditImpl = (
   pathSvc: PathServiceShape,
   fileSvc: NotebookFileServiceShape,
@@ -209,8 +270,19 @@ const makeEditImpl = (
             const diff = diffSvc.cellDiff(oldSource, newSource)
             const oldPreview = truncatePreview(oldSource, 400)
             const newPreview = truncatePreview(newSource, 400)
+            const targetType = request.cellType ?? cell.cell_type
+            const converted = targetType !== cell.cell_type
             const mode = request.clearOutputs ?? "auto"
-            const clearedOutputs = mode === "always" || (mode === "auto" && cell.cell_type === "code" && oldSource !== newSource)
+            const clearedByMode =
+              mode === "always" ||
+              (mode === "auto" && cell.cell_type === "code" && oldSource !== newSource)
+            // Converting a code cell drops its outputs/execution_count whatever
+            // clearOutputs says; the result reports whether anything was
+            // actually discarded.
+            const hadOutputs =
+              cell.cell_type === "code" &&
+              (cell.outputs.length > 0 || cell.execution_count !== null)
+            const clearedOutputs = clearedByMode || (converted && hadOutputs)
 
             yield* permSvc.ask({
               kind: "edit",
@@ -221,32 +293,39 @@ const makeEditImpl = (
                 filePath: abs,
                 cellIndex: idx,
                 cellType: cell.cell_type,
+                targetCellType: targetType,
+                converted,
+                tags: request.tags,
                 oldPreview,
                 newPreview,
                 diff
               }
             })
 
-            const newCell: CellRaw = (() => {
-              if (cell.cell_type === "code") {
-                const code = cell as CodeCellRaw
-                if (clearedOutputs) {
-                  return {
-                    ...code,
-                    source: newSource,
-                    outputs: [],
-                    execution_count: null
+            const metadata = applyTags(cell.metadata, request.tags)
+            const newCell: CellRaw = converted
+              ? convertCell(cell, targetType, newSource, metadata)
+              : (() => {
+                  if (cell.cell_type === "code") {
+                    const code = cell as CodeCellRaw
+                    if (clearedOutputs) {
+                      return {
+                        ...code,
+                        source: newSource,
+                        metadata,
+                        outputs: [],
+                        execution_count: null
+                      }
+                    }
+                    return { ...code, source: newSource, metadata }
                   }
-                }
-                return { ...code, source: newSource }
-              }
-              if (cell.cell_type === "markdown") {
-                const md = cell as MarkdownCellRaw
-                return { ...md, source: newSource }
-              }
-              const raw = cell as RawCellRaw
-              return { ...raw, source: newSource }
-            })()
+                  if (cell.cell_type === "markdown") {
+                    const md = cell as MarkdownCellRaw
+                    return { ...md, source: newSource, metadata }
+                  }
+                  const raw = cell as RawCellRaw
+                  return { ...raw, source: newSource, metadata }
+                })()
 
             const cells = notebook.cells.slice()
             cells[idx] = newCell
@@ -259,7 +338,10 @@ const makeEditImpl = (
               displayPath,
               absPath: abs,
               cellIndex: idx,
-              cellType: cell.cell_type,
+              cellType: targetType,
+              previousCellType: cell.cell_type,
+              converted,
+              tags: request.tags === undefined ? undefined : [...request.tags],
               clearedOutputs,
               diff,
               oldPreview,

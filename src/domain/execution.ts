@@ -43,7 +43,11 @@ export const CellExecutionSummarySchema = z.object({
     .array(
       z.object({
         mime: z.string(),
-        sizeBytes: z.number().int()
+        sizeBytes: z.number().int(),
+        /** base64 payload for image mimes (bounded by the runner). */
+        base64: z.string().optional(),
+        /** Present when the payload was omitted (too large / limit reached). */
+        notice: z.string().optional()
       })
     )
     .optional(),

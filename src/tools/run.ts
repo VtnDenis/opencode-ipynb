@@ -1,10 +1,13 @@
 import { z } from "zod"
 import { tool } from "../v1compat.js"
 import { Effect } from "effect"
-import type { ToolContext } from "../v1compat.js"
+import type { ToolAttachment, ToolContext } from "../v1compat.js"
 import { buildServices } from "../services/index.js"
 import { errorToMessage } from "../domain/errors.js"
 import { resolveToolOptions } from "./_resolveOptions.js"
+import { formatAttachment, pickExtensionForMime } from "../utils/attachments.js"
+import { truncateTraceback } from "../services/NotebookExecutionService.js"
+import { DEFAULT_MAX_TRACEBACK_CHARS } from "../utils/limits.js"
 
 const args = {
   filePath: z.string().describe("Absolute or relative path to the .ipynb file"),
@@ -24,6 +27,13 @@ const args = {
     .optional()
     .describe("Timeout in milliseconds (default 120000, from plugin options)"),
   save: z.boolean().optional().default(true).describe("Persist outputs to the notebook (default: true)"),
+  restart: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "Restart the notebook's Python kernel before executing (fresh state). Only meaningful with the warm kernel enabled; one-shot runs are already fresh. Use it for a clean mode='all' validation."
+    ),
   workingDirectory: z.string().optional().describe("Working directory for the Python runner"),
   maxOutputChars: z
     .number()
@@ -52,15 +62,15 @@ export const ipynbRunTool = tool({
           kernel: input.kernel,
           timeoutMs,
           save: input.save,
+          restart: input.restart,
           workingDirectory: input.workingDirectory,
-          maxOutputChars
+          maxOutputChars,
+          abortSignal: context.abort
         })
       )
       const lines: string[] = []
       const usedWarmKernel =
-        pluginOpts.warmKernel &&
-        services.kernel.isRunning(result.absPath) &&
-        (input.mode === "all" || input.mode === "cell")
+        pluginOpts.warmKernel && services.kernel.isRunning(result.absPath)
       lines.push(`Executed ${result.executedCells.length} cell(s) in \`${result.displayPath}\` (${result.durationMs}ms).`)
       lines.push(`Saved: ${result.saved}`)
       if (usedWarmKernel) {
@@ -69,18 +79,51 @@ export const ipynbRunTool = tool({
           lines.push(`Kernel: warm pid=${k.pid} requestsHandled=${k.requestsHandled}`)
         }
       }
+      const cellError = result.response.success ? undefined : result.response.error
+      if (cellError) {
+        lines.push("")
+        lines.push(
+          cellError.cellIndex >= 0
+            ? `Execution failed at cell ${cellError.cellIndex}: ${cellError.ename}: ${cellError.evalue}`
+            : `Execution failed: ${cellError.ename}: ${cellError.evalue}`
+        )
+        const traceback = truncateTraceback(cellError.traceback, DEFAULT_MAX_TRACEBACK_CHARS)
+        if (traceback.length > 0) {
+          lines.push("Traceback:")
+          for (const line of traceback.join("\n").split("\n")) {
+            lines.push(`  ${line}`)
+          }
+        }
+      }
       lines.push("")
+      const attachments: ToolAttachment[] = []
       for (const out of result.response.outputs) {
         lines.push(`- cell [${out.cellIndex}] ${out.status}`)
-        if (out.stdout) lines.push(`  stdout: ${out.stdout.slice(0, 200)}`)
-        if (out.stderr) lines.push(`  stderr: ${out.stderr.slice(0, 200)}`)
-        if (out.resultPreview) lines.push(`  result: ${out.resultPreview.slice(0, 200)}`)
+        // `maxOutputChars` already bounded the values; preview caps are only
+        // here to keep the rendered block readable for the model.
+        if (out.stdout) lines.push(`  stdout: ${out.stdout.slice(0, 4_000)}`)
+        if (out.stderr) lines.push(`  stderr: ${out.stderr.slice(0, 4_000)}`)
+        if (out.resultPreview) lines.push(`  result: ${out.resultPreview.slice(0, 4_000)}`)
         if (out.displayData && out.displayData.length > 0) {
-          const display = out.displayData
-            .slice(0, 5)
-            .map((d) => `${d.mime} (${d.sizeBytes} bytes)`)
-            .join(", ")
-          const suffix = out.displayData.length > 5 ? `, +${out.displayData.length - 5} more` : ""
+          const rendered = out.displayData.map((d, i) => {
+            let label = `${d.mime} (${d.sizeBytes} bytes)`
+            if (d.base64 !== undefined) {
+              const ext = pickExtensionForMime(d.mime)
+              attachments.push(
+                formatAttachment(
+                  d.mime,
+                  d.base64,
+                  `cell-${out.cellIndex}-image-${i}${ext ? `.${ext}` : ""}`
+                )
+              )
+              label += " [attached]"
+            } else if (d.notice !== undefined) {
+              label += ` [${d.notice}]`
+            }
+            return label
+          })
+          const display = rendered.slice(0, 5).join(", ")
+          const suffix = rendered.length > 5 ? `, +${rendered.length - 5} more` : ""
           lines.push(`  display_data: ${display}${suffix}`)
         }
         if (out.errors && out.errors.length > 0) {
@@ -89,16 +132,33 @@ export const ipynbRunTool = tool({
           }
         }
       }
-      return {
+      const toolResult: {
+        title: string
+        output: string
+        metadata: Record<string, unknown>
+        attachments?: ToolAttachment[]
+      } = {
         title: `ipynb_run ${input.mode} on ${input.filePath}`,
         output: lines.join("\n"),
         metadata: {
           filePath: result.absPath,
           executedCells: result.executedCells,
           durationMs: result.durationMs,
-          saved: result.saved
+          saved: result.saved,
+          ...(cellError === undefined
+            ? {}
+            : {
+                error: true,
+                failedCellIndex: cellError.cellIndex,
+                ename: cellError.ename,
+                evalue: cellError.evalue
+              })
         }
       }
+      if (attachments.length > 0) {
+        toolResult.attachments = attachments
+      }
+      return toolResult
     } catch (err) {
       const message = errorToMessage(err)
       return {

@@ -10,6 +10,7 @@ import { makePermissionService, type PermissionServiceShape } from "./Permission
 import { makeNotebookFileService, type NotebookFileServiceShape } from "./NotebookFileService.js"
 import { makeDiffService, type DiffServiceShape } from "./DiffService.js"
 import { makeInspectImpl } from "./NotebookInspectService.js"
+import { makeSearchImpl, type NotebookSearchServiceShape } from "./NotebookSearchService.js"
 import { makeReadImpl, type NotebookReadServiceShape } from "./NotebookReadService.js"
 import { makeEditImpl, type NotebookEditServiceShape } from "./NotebookEditService.js"
 import { makeCleanImpl, type NotebookCleanServiceShape } from "./NotebookCleanService.js"
@@ -23,6 +24,7 @@ export { PermissionService, type PermissionServiceShape, type PermissionRequest,
 export { NotebookFileService, type NotebookFileServiceShape, makeNotebookFileService } from "./NotebookFileService.js"
 export { DiffService, type DiffServiceShape, makeDiffService } from "./DiffService.js"
 export { NotebookInspectService, makeInspectImpl } from "./NotebookInspectService.js"
+export { NotebookSearchService, type NotebookSearchServiceShape, makeSearchImpl } from "./NotebookSearchService.js"
 export { NotebookReadService, type NotebookReadServiceShape, makeReadImpl } from "./NotebookReadService.js"
 export { NotebookEditService, type NotebookEditServiceShape, makeEditImpl } from "./NotebookEditService.js"
 export { NotebookCleanService, type NotebookCleanServiceShape, makeCleanImpl } from "./NotebookCleanService.js"
@@ -54,6 +56,7 @@ export interface NotebookServices {
   readonly python: PythonServiceShape
   readonly kernel: KernelManagerShape
   readonly inspect: ReturnType<typeof makeInspectImpl>
+  readonly search: NotebookSearchServiceShape
   readonly read: NotebookReadServiceShape
   readonly edit: NotebookEditServiceShape
   readonly clean: NotebookCleanServiceShape
@@ -127,6 +130,7 @@ export const buildServices = (
     defaultTimeoutMs: resolved.defaultTimeoutMs
   })
   const inspectSvc = makeInspectImpl(pathSvc, fileSvc)
+  const searchSvc = makeSearchImpl(pathSvc, fileSvc)
   const readSvc = makeReadImpl(pathSvc, fileSvc)
   const editSvc = makeEditImpl(pathSvc, fileSvc, diffSvc, permissionSvc)
   const cleanSvc = makeCleanImpl(pathSvc, fileSvc, permissionSvc)
@@ -145,6 +149,7 @@ export const buildServices = (
     python: pythonSvc,
     kernel: kernelMgr,
     inspect: inspectSvc,
+    search: searchSvc,
     read: readSvc,
     edit: editSvc,
     clean: cleanSvc,

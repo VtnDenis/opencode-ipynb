@@ -23,6 +23,7 @@ venv still produces a structured error instead of a traceback.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -33,6 +34,21 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 PROBE_DEPS = ("nbformat", "nbclient", "jupyter_client", "ipykernel")
+
+# Image payloads are inlined as base64 in the response so the TS side can
+# forward them to the model as attachments. Both bounds are per response:
+# a single oversized image is omitted, and only the first
+# ``MAX_IMAGES_PER_RESPONSE`` images carry their payload.
+IMAGE_MIMES = (
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/gif",
+    "image/svg+xml",
+    "image/webp",
+)
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGES_PER_RESPONSE = 10
 
 
 def _read_request() -> Dict[str, Any]:
@@ -236,7 +252,23 @@ def _select_cell_indexes(req: Dict[str, Any], total: int) -> List[int]:
     raise ValueError(f"unsupported mode: {mode!r}")
 
 
-def _summarize_output(out: Dict[str, Any]) -> Dict[str, Any]:
+def _encode_image_value(mime: str, value: str) -> "tuple[Optional[str], int]":
+    """Return (base64_payload_or_None, size_in_bytes).
+
+    Jupyter stores PNG/JPEG/GIF/WebP payloads as base64 text and SVG as raw
+    XML text. The wire format is always base64, so SVG is encoded here.
+    """
+    if mime == "image/svg+xml":
+        raw = value.encode("utf-8", errors="replace")
+        return base64.b64encode(raw).decode("ascii"), len(raw)
+    # base64 text: 4 chars -> 3 bytes, minus the padding.
+    padding = 2 if value.endswith("==") else (1 if value.endswith("=") else 0)
+    return value, max(0, (len(value) * 3) // 4 - padding)
+
+
+def _summarize_output(
+    out: Dict[str, Any], image_state: Optional[Dict[str, int]] = None
+) -> Dict[str, Any]:
     """Translate one Jupyter output into the plugin's CellExecutionSummary shape."""
     ot = out.get("output_type")
     summary: Dict[str, Any] = {}
@@ -269,14 +301,38 @@ def _summarize_output(out: Dict[str, Any]) -> Dict[str, Any]:
                     plain = "".join(str(t) for t in plain)
                 summary["resultPreview"] = str(plain)
             for mime, value in data.items():
-                if mime.startswith("image/"):
-                    if isinstance(value, str):
-                        size_bytes = max(0, (len(value) * 3) // 4)
-                    else:
-                        size_bytes = 0
-                    summary.setdefault("displayData", []).append(
-                        {"mime": mime, "sizeBytes": size_bytes}
+                base_mime = str(mime).split(";", 1)[0].strip().lower()
+                if base_mime not in IMAGE_MIMES:
+                    continue
+                entry: Dict[str, Any] = {}
+                encoded: Optional[str] = None
+                size_bytes = 0
+                if isinstance(value, str):
+                    encoded, size_bytes = _encode_image_value(base_mime, value)
+                entry["mime"] = str(mime)
+                entry["sizeBytes"] = size_bytes
+                budget = (
+                    image_state.get("remaining", 0)
+                    if image_state is not None
+                    else MAX_IMAGES_PER_RESPONSE
+                )
+                if encoded is not None and size_bytes > MAX_IMAGE_BYTES:
+                    entry["notice"] = (
+                        f"omitted: image payload is {size_bytes} bytes, above the "
+                        f"{MAX_IMAGE_BYTES}-byte limit"
                     )
+                elif encoded is not None and budget <= 0:
+                    entry["notice"] = (
+                        f"omitted: only the first {MAX_IMAGES_PER_RESPONSE} images "
+                        "of a response carry their payload"
+                    )
+                elif encoded is not None:
+                    entry["base64"] = encoded
+                    if image_state is not None:
+                        image_state["remaining"] = budget - 1
+                else:
+                    entry["notice"] = "omitted: unsupported image payload type"
+                summary.setdefault("displayData", []).append(entry)
     return summary
 
 
@@ -297,6 +353,7 @@ def _build_cell_summary(
     status: str,
     max_output_chars: int,
     duration_ms: int,
+    image_state: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
         "cellIndex": cell_index,
@@ -311,7 +368,7 @@ def _build_cell_summary(
     if raw_outputs:
         summary["rawOutputs"] = raw_outputs
     for out in raw_outputs:
-        addition = _summarize_output(out)
+        addition = _summarize_output(out, image_state)
         _merge_summaries(summary, addition)
     if "errors" in summary and summary["errors"]:
         summary["status"] = "error"
@@ -365,19 +422,136 @@ def _resolve_kernel_name(req: Dict[str, Any], nb: Any) -> Optional[str]:
     return None
 
 
+def _cell_source(cell: Dict[str, Any]) -> str:
+    src = cell.get("source", "")
+    if isinstance(src, list):
+        src = "".join(src)
+    return src if isinstance(src, str) else ""
+
+
+def _exception_error_entry(exc: BaseException) -> Dict[str, Any]:
+    """Build an ``errors[]`` entry from an execution exception.
+
+    nbclient's ``CellExecutionError`` carries the kernel ``ename``/``evalue``
+    and a formatted traceback, so we prefer those over the generic
+    ``type(exc).__name__`` / ``str(exc)`` fallback.
+    """
+    ename = getattr(exc, "ename", None)
+    if not isinstance(ename, str) or not ename:
+        ename = type(exc).__name__
+    evalue = getattr(exc, "evalue", None)
+    if not isinstance(evalue, str):
+        evalue = str(exc)
+    tb = getattr(exc, "traceback", None)
+    if isinstance(tb, str):
+        tb_lines = tb.splitlines()
+    elif isinstance(tb, (list, tuple)):
+        tb_lines = [str(line) for line in tb]
+    else:
+        tb_lines = traceback.format_exception(exc)
+    return {"ename": ename, "evalue": evalue, "traceback": tb_lines}
+
+
+def _merge_error_entry(summary: Dict[str, Any], entry: Dict[str, Any]) -> None:
+    """Add the exception-derived error to a cell summary, unless the cell's
+    own outputs already recorded the same failure (avoid duplicates)."""
+    errors = summary.setdefault("errors", [])
+    for existing in errors:
+        if (
+            existing.get("ename") == entry["ename"]
+            and existing.get("evalue") == entry["evalue"]
+        ):
+            summary["status"] = "error"
+            return
+    errors.append(entry)
+    summary["status"] = "error"
+
+
+def _failing_cell_index(
+    exc: BaseException,
+    current_index: Optional[int],
+    target_code_cells: List[int],
+    nb: Any,
+) -> int:
+    """Best-effort cell index for the exception. ``current_index`` is tracked
+    by the execution loop and is the most reliable signal."""
+    if isinstance(current_index, int) and current_index in target_code_cells:
+        return current_index
+    idx = getattr(exc, "cell_index", None)
+    if isinstance(idx, int) and idx in target_code_cells:
+        return idx
+    msg = str(exc)
+    for candidate in target_code_cells:
+        src = _cell_source(nb.cells[candidate])
+        if src and src.strip() in msg:
+            return candidate
+    return target_code_cells[0] if target_code_cells else -1
+
+
+def _build_failure_response(
+    req: Dict[str, Any],
+    started: float,
+    exc: BaseException,
+    nb: Any,
+    executed_code_cells: List[int],
+    image_state: Dict[str, int],
+    cell_durations_ms: Optional[Dict[int, int]] = None,
+    request_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Build the response for a failed cell execution.
+
+    Unlike the previous behaviour (``outputs: []`` + an error envelope), this
+    exposes the summaries of every cell executed up to and including the
+    failing one, with ``status: "error"`` and a merged ``errors[]`` entry
+    built from the exception. That lets the TypeScript side persist the
+    failure into the notebook exactly like Jupyter would.
+    """
+    failure = _exception_error_entry(exc)
+    durations = cell_durations_ms or {}
+    max_output_chars = int(req.get("maxOutputChars", 12_000))
+    failing_index = executed_code_cells[-1] if executed_code_cells else -1
+    outputs: List[Dict[str, Any]] = []
+    for idx in executed_code_cells:
+        summary = _build_cell_summary(
+            cell_index=idx,
+            cell=nb.cells[idx],
+            status="ok",
+            max_output_chars=max_output_chars,
+            duration_ms=durations.get(idx, 0),
+            image_state=image_state,
+        )
+        if idx == failing_index:
+            _merge_error_entry(summary, failure)
+        outputs.append(summary)
+    response: Dict[str, Any] = {
+        "success": False,
+        "executedCells": list(executed_code_cells),
+        "durationMs": int((time.time() - started) * 1000),
+        "saved": False,
+        "outputs": outputs,
+        "error": {
+            "kind": "CellExecutionError",
+            "cellIndex": failing_index,
+            "ename": failure["ename"],
+            "evalue": failure["evalue"],
+            "traceback": list(failure["traceback"]),
+        },
+    }
+    if request_id is not None:
+        response["id"] = request_id
+    return response
+
+
 def _run_nbclient(
     req: Dict[str, Any],
     nb: Any,
     file_path: str,
     started: float,
 ) -> Dict[str, Any]:
-    """Run the request through nbclient. Shared by the one-shot path and
-    the serve path. The notebook object is mutated in place (outputs are
-    populated); the caller decides whether to save the result.
+    """Run the request through nbclient (one-shot / cold path).
 
-    ``nb`` may be either an ``nbformat.NotebookNode`` (one-shot) or the
-    cached one held by the serve loop. Both expose ``.cells`` /
-    ``.metadata`` and accept ``NotebookClient``'s constructor.
+    The notebook object is mutated in place (outputs are populated); the
+    caller decides whether to save the result.
     """
     from nbclient import NotebookClient  # type: ignore
 
@@ -409,6 +583,10 @@ def _run_nbclient(
 
     timeout_s = max(1, int(req.get("timeoutMs", 120_000) / 1000))
     kernel_name = _resolve_kernel_name(req, nb) or "python3"
+    max_output_chars = int(req.get("maxOutputChars", 12_000))
+    image_state: Dict[str, int] = {"remaining": MAX_IMAGES_PER_RESPONSE}
+    executed_code_cells: List[int] = []
+    current_index: Optional[int] = None
     try:
         client = NotebookClient(
             nb,
@@ -424,29 +602,16 @@ def _run_nbclient(
         # requested slice.
         with client.setup_kernel():
             for idx in target_code_cells:
+                current_index = idx
                 client.execute_cell(nb.cells[idx], idx)
+                executed_code_cells.append(idx)
+                current_index = None
     except Exception as exc:
-        failing_cell_index = getattr(exc, "cell_index", None)
-        if not isinstance(failing_cell_index, int) or failing_cell_index < 0:
-            msg = str(exc)
-            for idx in target_code_cells:
-                cell = nb.cells[idx]
-                src = cell.get("source", "")
-                if isinstance(src, list):
-                    src = "".join(src)
-                if src and src.strip() in msg:
-                    failing_cell_index = idx
-                    break
-            else:
-                failing_cell_index = target_code_cells[0] if target_code_cells else -1
-        return _error_response(
-            req,
-            started,
-            "CellExecutionError",
-            type(exc).__name__,
-            str(exc),
-            failing_cell_index,
-            traceback.format_exception(exc),
+        failing = _failing_cell_index(exc, current_index, target_code_cells, nb)
+        if failing in target_code_cells and failing not in executed_code_cells:
+            executed_code_cells.append(failing)
+        return _build_failure_response(
+            req, started, exc, nb, executed_code_cells, image_state
         )
 
     outputs: List[Dict[str, Any]] = []
@@ -459,8 +624,9 @@ def _run_nbclient(
                 cell_index=i,
                 cell=cell,
                 status="ok",
-                max_output_chars=int(req.get("maxOutputChars", 12_000)),
+                max_output_chars=max_output_chars,
                 duration_ms=0,
+                image_state=image_state,
             )
         )
 
@@ -476,11 +642,16 @@ def _run_nbclient(
 def _run_serve_request(
     req: Dict[str, Any],
     client: Any,
-    nb: Any,
     file_path: str,
+    warm_kernel_name: Optional[str],
 ) -> Dict[str, Any]:
     """Process one request inside the serve loop, using the already-warm
-    kernel. Errors are returned to the caller but the kernel is kept alive.
+    kernel.
+
+    The notebook is re-read from disk on every request so an ``ipynb_edit``
+    between two calls is picked up without restarting the kernel. Cell
+    execution errors and notebook read errors are returned to the caller as
+    structured responses; the kernel is kept alive in both cases.
     """
     started = time.time()
     req_id = req.get("id") if isinstance(req.get("id"), int) else None
@@ -522,6 +693,52 @@ def _run_serve_request(
             request_id=req_id,
         )
 
+    # A warm kernel cannot be swapped in the middle of a session; report the
+    # mismatch instead of silently running on the wrong kernel.
+    requested_kernel = req.get("kernel")
+    if (
+        isinstance(requested_kernel, str)
+        and requested_kernel
+        and isinstance(warm_kernel_name, str)
+        and warm_kernel_name
+        and requested_kernel != warm_kernel_name
+    ):
+        return _error_response(
+            req,
+            started,
+            "PythonRunnerError",
+            "InvalidRequest",
+            (
+                f"kernel {requested_kernel!r} does not match the warm kernel "
+                f"{warm_kernel_name!r}; restart the kernel to switch kernels"
+            ),
+            -1,
+            request_id=req_id,
+        )
+
+    # Fresh read on every request: the file may have been edited since the
+    # kernel was started. A read/parse failure is reported as a structured
+    # error and does NOT kill the warm kernel.
+    try:
+        import nbformat  # type: ignore
+
+        nb = nbformat.read(req["filePath"], as_version=4)
+    except Exception as exc:
+        return _error_response(
+            req,
+            started,
+            "PythonRunnerError",
+            type(exc).__name__,
+            f"Failed to read notebook {req['filePath']}: {exc}",
+            -1,
+            traceback.format_exception(exc),
+            request_id=req_id,
+        )
+
+    # Point the client at the freshly read notebook so output handlers
+    # (widgets, display updates, coalescing) operate on these cells.
+    client.nb = nb
+
     try:
         cell_indexes = _select_cell_indexes(req, len(nb.cells))
     except Exception as exc:
@@ -562,41 +779,37 @@ def _run_serve_request(
             response["id"] = req_id
         return response
 
-    timeout_s = max(1, int(req.get("timeoutMs", 120_000) / 1000))
+    max_output_chars = int(req.get("maxOutputChars", 12_000))
+    image_state: Dict[str, int] = {"remaining": MAX_IMAGES_PER_RESPONSE}
     # Per-cell durations: capture start/end around each `execute_cell` call so
     # the `cell_duration_ms` field reflects what actually happened, not the
     # batch total attributed to the first cell.
     cell_durations_ms: Dict[int, int] = {}
+    executed_code_cells: List[int] = []
+    current_index: Optional[int] = None
     try:
         # Run each target cell through the existing kernel via execute_cell.
         # We pass the kernel client explicitly so the kernel stays warm.
         for idx in target_code_cells:
             cell = nb.cells[idx]
+            current_index = idx
             cell_start = time.monotonic()
             client.execute_cell(cell, idx)
             cell_durations_ms[idx] = int((time.monotonic() - cell_start) * 1000)
+            executed_code_cells.append(idx)
+            current_index = None
     except Exception as exc:
-        failing_cell_index = getattr(exc, "cell_index", None)
-        if not isinstance(failing_cell_index, int) or failing_cell_index < 0:
-            msg = str(exc)
-            for idx in target_code_cells:
-                cell = nb.cells[idx]
-                src = cell.get("source", "")
-                if isinstance(src, list):
-                    src = "".join(src)
-                if src and src.strip() in msg:
-                    failing_cell_index = idx
-                    break
-            else:
-                failing_cell_index = target_code_cells[0] if target_code_cells else -1
-        return _error_response(
+        failing = _failing_cell_index(exc, current_index, target_code_cells, nb)
+        if failing in target_code_cells and failing not in executed_code_cells:
+            executed_code_cells.append(failing)
+        return _build_failure_response(
             req,
             started,
-            "CellExecutionError",
-            type(exc).__name__,
-            str(exc),
-            failing_cell_index,
-            traceback.format_exception(exc),
+            exc,
+            nb,
+            executed_code_cells,
+            image_state,
+            cell_durations_ms,
             request_id=req_id,
         )
 
@@ -610,8 +823,9 @@ def _run_serve_request(
                 cell_index=i,
                 cell=cell,
                 status="ok",
-                max_output_chars=int(req.get("maxOutputChars", 12_000)),
+                max_output_chars=max_output_chars,
                 duration_ms=cell_durations_ms.get(i, 0),
+                image_state=image_state,
             )
         )
 
@@ -666,6 +880,9 @@ def _serve_mode(init_req: Dict[str, Any]) -> int:
         return 0
 
     try:
+        # Read once at init: the object is used to resolve the kernel name
+        # and to construct the client. Every request re-reads the file (see
+        # ``_run_serve_request``) so edits are picked up without a restart.
         nb = nbformat.read(file_path, as_version=4)
     except Exception as exc:
         _write_response(
@@ -692,6 +909,15 @@ def _serve_mode(init_req: Dict[str, Any]) -> int:
             kernel_name=kernel_name,
             resources={
                 "metadata": {"path": os.path.dirname(os.path.abspath(file_path)) or "."}
+            },
+            # A timed-out cell must not leave the warm kernel busy forever:
+            # interrupt it (SIGINT) and surface a structured CellTimeoutError
+            # instead of blocking every following request.
+            interrupt_on_timeout=True,
+            error_on_timeout={
+                "ename": "CellTimeoutError",
+                "evalue": f"Cell execution timed out after {timeout_s} seconds",
+                "traceback": [],
             },
         )
         # Start the kernel once for the whole serve loop. We deliberately do
@@ -763,7 +989,7 @@ def _serve_mode(init_req: Dict[str, Any]) -> int:
                 break
 
             try:
-                response = _run_serve_request(req, client, nb, file_path)
+                response = _run_serve_request(req, client, file_path, kernel_name)
             except Exception as exc:
                 req_id = req.get("id") if isinstance(req.get("id"), int) else None
                 response = _error_response(

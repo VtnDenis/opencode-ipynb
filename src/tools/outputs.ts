@@ -1,7 +1,7 @@
 import { z } from "zod"
 import { tool } from "../v1compat.js"
 import { Effect } from "effect"
-import type { ToolContext } from "../v1compat.js"
+import type { ToolAttachment, ToolContext } from "../v1compat.js"
 import { buildServices } from "../services/index.js"
 import { errorToMessage, NotebookNotImplementedError } from "../domain/errors.js"
 import { resolveToolOptions } from "./_resolveOptions.js"
@@ -35,7 +35,9 @@ const args = {
     .boolean()
     .optional()
     .default(false)
-    .describe("For read: include image payloads (not yet supported; will still be omitted)"),
+    .describe(
+      "For read: include image payloads as base64 data: attachments (default: false; at most 20 per read)"
+    ),
   maxOutputChars: z
     .number()
     .int()
@@ -48,7 +50,7 @@ const args = {
 
 export const ipynbOutputsTool = tool({
   description:
-    "Work with cell outputs: list (with pagination), read (per-cell), read_error, clear_cell, clear_all. Always asks permission before clearing. Images and base64 payloads are omitted by default.",
+    "Work with cell outputs: list (with pagination), read (per-cell), read_error, clear_cell, clear_all. Always asks permission before clearing. Images and base64 payloads are omitted by default; set includeImages=true on read to receive them as attachments.",
   args,
   async execute(input: z.infer<z.ZodObject<typeof args>>, context: ToolContext) {
     const services = buildServices(context)
@@ -105,11 +107,20 @@ export const ipynbOutputsTool = tool({
             maxOutputChars: input.maxOutputChars ?? pluginOpts.defaultMaxOutputChars
           })
         )
-        return {
+        const toolResult: {
+          title: string
+          output: string
+          metadata: Record<string, unknown>
+          attachments?: ToolAttachment[]
+        } = {
           title: `Read outputs of cell [${input.cellIndex}] in ${input.filePath}`,
           output: result.rendered,
           metadata: { cellIndex: result.cellIndex, count: result.outputCount }
         }
+        if (result.attachments.length > 0) {
+          toolResult.attachments = [...result.attachments]
+        }
+        return toolResult
       }
 
       if (input.operation === "read_error") {

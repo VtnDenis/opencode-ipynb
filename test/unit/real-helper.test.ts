@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process"
 import * as path from "node:path"
 import * as os from "node:os"
 import * as fs from "node:fs"
-import { Effect, Cause } from "effect"
+import { Effect } from "effect"
 import { makePathService } from "../../src/services/PathService.js"
 import { makePermissionService } from "../../src/services/PermissionService.js"
 import { makeNotebookFileService } from "../../src/services/NotebookFileService.js"
@@ -218,7 +218,7 @@ describeIf(
     }, 120_000)
 
     it("captures the failing cell index when a cell raises", async () => {
-      const exit = await Effect.runPromiseExit(
+      const result = await Effect.runPromise(
         buildExec(FIXTURES).execute(path.join(FIXTURES, "error-propagation.ipynb"), {
           mode: "all",
           cellIndex: undefined,
@@ -231,15 +231,11 @@ describeIf(
           maxOutputChars: 4_000
         })
       )
-      if (exit._tag === "Failure") {
-        const opt = Cause.failureOption(exit.cause)
-        if (opt._tag !== "Some") throw new Error("expected a failure with a value")
-        const e = opt.value as { _tag?: string; cellIndex?: number }
-        expect(e._tag).toBe("NotebookExecution")
-        expect(e.cellIndex).toBe(1)
-      } else {
-        throw new Error("expected Failure, got Success")
-      }
+      expect(result.response.success).toBe(false)
+      expect(result.response.error?.cellIndex).toBe(1)
+      expect(result.response.error?.ename).toBe("ValueError")
+      expect(result.executedCells).toEqual([0, 1])
+      expect(result.response.outputs.find((o) => o.cellIndex === 1)?.status).toBe("error")
     }, 120_000)
 
     it("save=true writes execution_count and outputs back to the notebook", async () => {

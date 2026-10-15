@@ -39,6 +39,10 @@ export interface ExecutionRequest {
   readonly save: boolean
   readonly workingDirectory: string | undefined
   readonly maxOutputChars: number
+  /** Restart the warm kernel (fresh Python state) before executing. No-op when the warm kernel is disabled. */
+  readonly restart?: boolean | undefined
+  /** Session abort signal (V2 tool context); kills the runner on abort. */
+  readonly abortSignal?: AbortSignal | undefined
 }
 
 export interface ExecutionResult {
@@ -76,76 +80,121 @@ export class NotebookExecutionService extends Context.Tag("@ipynb/NotebookExecut
   NotebookExecutionServiceShape
 >() {}
 
+/**
+ * Kill the helper *and* its process group when we spawned it detached.
+ * The ipykernel started by nbclient lives in its own session (jupyter_client
+ * uses `start_new_session=True`) and sees its parent die, so it reaps itself;
+ * the group kill makes sure the helper's other children die immediately too.
+ */
+const killProcessTree = (child: { pid?: number | undefined; kill: (signal: NodeJS.Signals) => boolean }): void => {
+  const pid = child.pid
+  if (pid !== undefined && process.platform !== "win32") {
+    try {
+      process.kill(-pid, "SIGKILL")
+      return
+    } catch {
+      // Fall through to the direct child kill (group already gone).
+    }
+  }
+  try {
+    child.kill("SIGKILL")
+  } catch {
+    // Child may already be dead; ignore.
+  }
+}
+
 const runPython = (
   pythonPath: string,
   helperPath: string,
   payload: RunRequest,
   workingDirectory: string | undefined,
-  timeoutMs: number
+  timeoutMs: number,
+  abortSignal?: AbortSignal
 ): Effect.Effect<RunResponse, NotebookExecutionError | PythonRunnerError, never> =>
   Effect.gen(function* () {
-    const result = yield* Effect.tryPromise<unknown>((signal) => {
-      return new Promise<unknown>((resolve, reject) => {
-        const child = spawn(
-          pythonPath,
-          [helperPath],
-          {
+    const result = yield* Effect.tryPromise<unknown, PythonRunnerError>({
+      try: (signal) => {
+        const combined = abortSignal ? AbortSignal.any([signal, abortSignal]) : signal
+        return new Promise<unknown>((resolve, reject) => {
+          const child = spawn(pythonPath, [helperPath], {
             cwd: workingDirectory ?? process.cwd(),
             stdio: ["pipe", "pipe", "pipe"],
-            signal
-          }
-        )
-        const stdoutChunks: Buffer[] = []
-        const stderrChunks: Buffer[] = []
-        const timer = setTimeout(() => {
-          child.kill("SIGKILL")
-          reject(new Error(`python runner timed out after ${timeoutMs}ms`))
-        }, timeoutMs)
-        child.stdout.on("data", (chunk: Buffer) => stdoutChunks.push(chunk))
-        child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk))
-        child.on("error", (err) => {
-          clearTimeout(timer)
-          reject(err instanceof Error ? err : new Error(String(err)))
-        })
-        child.on("close", (code) => {
-          clearTimeout(timer)
-          const stdout = Buffer.concat(stdoutChunks).toString("utf8")
-          const stderr = Buffer.concat(stderrChunks).toString("utf8")
-          if (code !== 0) {
-            reject(new Error(`python runner exited with code ${code}: ${stderr.slice(0, 500)}`))
-            return
-          }
-          try {
-            const parsed = JSON.parse(stdout) as unknown
-            resolve(parsed)
-          } catch (err) {
-            reject(new Error(`python runner produced invalid JSON: ${err instanceof Error ? err.message : String(err)}`))
-          }
-        })
-        try {
-          if (!child.stdin.writable) {
-            clearTimeout(timer)
-            child.kill("SIGKILL")
-            reject(new Error("python helper stdin is closed before write"))
-            return
-          }
-          child.stdin.write(JSON.stringify(payload))
-          child.stdin.end()
-        } catch (err) {
-          clearTimeout(timer)
-          child.kill("SIGKILL")
-          reject(new Error(`failed to write request to python helper: ${err instanceof Error ? err.message : String(err)}`))
-        }
-      })
-    }).pipe(
-      Effect.mapError(
-        (err): NotebookExecutionError | PythonRunnerError =>
-          new PythonRunnerError({
-            message: err instanceof Error ? err.message : String(err),
-            detail: "see logs for full output"
+            // Detached so a timeout/abort can kill the whole process group
+            // (helper + any child it spawned) instead of orphaning them.
+            detached: process.platform !== "win32"
           })
-      )
-    )
+          const stdoutChunks: Buffer[] = []
+          const stderrChunks: Buffer[] = []
+          let settled = false
+          const finish = (fn: () => void): void => {
+            if (settled) return
+            settled = true
+            clearTimeout(timer)
+            combined.removeEventListener("abort", onAbort)
+            fn()
+          }
+          const timer = setTimeout(() => {
+            killProcessTree(child)
+            finish(() => reject(new Error(`python runner timed out after ${timeoutMs}ms`)))
+          }, timeoutMs)
+          const onAbort = (): void => {
+            killProcessTree(child)
+            finish(() => reject(new Error("python runner aborted")))
+          }
+          if (combined.aborted) {
+            onAbort()
+          } else {
+            combined.addEventListener("abort", onAbort, { once: true })
+          }
+          child.stdout.on("data", (chunk: Buffer) => stdoutChunks.push(chunk))
+          child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk))
+          // A destroyed helper stdin can emit EPIPE asynchronously; without
+          // a listener that becomes an uncaught error. The "close" handler
+          // below is the one that decides the outcome.
+          child.stdin?.on("error", () => {})
+          child.on("error", (err) => {
+            finish(() => reject(err instanceof Error ? err : new Error(String(err))))
+          })
+          child.on("close", (code) => {
+            const stdout = Buffer.concat(stdoutChunks).toString("utf8")
+            const stderr = Buffer.concat(stderrChunks).toString("utf8")
+            if (code !== 0) {
+              finish(() => reject(new Error(`python runner exited with code ${code}: ${stderr.slice(0, 500)}`)))
+              return
+            }
+            let parsed: unknown
+            try {
+              parsed = JSON.parse(stdout) as unknown
+            } catch (err) {
+              finish(() => reject(new Error(`python runner produced invalid JSON: ${err instanceof Error ? err.message : String(err)}`)))
+              return
+            }
+            finish(() => resolve(parsed))
+          })
+          try {
+            if (!child.stdin.writable) {
+              finish(() => {
+                child.kill("SIGKILL")
+                reject(new Error("python helper stdin is closed before write"))
+              })
+              return
+            }
+            child.stdin.write(JSON.stringify(payload))
+            child.stdin.end()
+          } catch (err) {
+            finish(() => {
+              killProcessTree(child)
+              reject(new Error(`failed to write request to python helper: ${err instanceof Error ? err.message : String(err)}`))
+            })
+          }
+        })
+      },
+      catch: (err): PythonRunnerError =>
+        new PythonRunnerError({
+          message: err instanceof Error ? err.message : String(err),
+          detail: "see logs for full output"
+        })
+    })
     const parsed = RunResponseSchema.safeParse(result)
     if (!parsed.success) {
       return yield* new PythonRunnerError({
@@ -153,13 +202,9 @@ const runPython = (
         detail: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")
       })
     }
-    if (!parsed.data.success && parsed.data.error) {
-      return yield* new NotebookExecutionError({
-        message: `${parsed.data.error.ename}: ${parsed.data.error.evalue}`,
-        filePath: payload.filePath,
-        cellIndex: parsed.data.error.cellIndex
-      })
-    }
+    // Cell execution errors are data, not infrastructure failures: the
+    // response carries the per-cell summaries (including the failing cell)
+    // so the caller can persist them before reporting the failure.
     return parsed.data
   })
 
@@ -266,9 +311,16 @@ export const buildPersistedOutputs = (
   }
   if (summary.displayData !== undefined && summary.displayData.length > 0) {
     for (const item of summary.displayData) {
+      // Persist the real image payload when the runner inlined it (what
+      // Jupyter would write); fall back to a size placeholder otherwise.
       outputs.push({
         output_type: "display_data",
-        data: { [item.mime]: `(${item.sizeBytes} bytes, omitted by plugin)` },
+        data: {
+          [item.mime]:
+            item.base64 !== undefined
+              ? item.base64
+              : `(${item.sizeBytes} bytes, omitted by plugin)`
+        },
         metadata: {}
       })
     }
@@ -297,11 +349,18 @@ const makeExecutionImpl = (
   const warmKernel = execOpts?.warmKernel ?? false
   const defaultTimeoutMs = execOpts?.defaultTimeoutMs ?? 120_000
 
-  // Only `all` and `cell` use the warm kernel; the one-shot helper handles
-  // `range` and `from` because those modes don't share state across cells in
-  // a way the warm kernel can reuse, and `env` is a one-shot probe.
+  // Every execution mode reuses the warm kernel when enabled: the serve
+  // helper re-reads the notebook from disk on each request, so `range`/`from`
+  // share the kernel state (variables, imports) with `cell`/`all` instead of
+  // starting a fresh one-shot process per call.
+  const WARM_KERNEL_MODES: ReadonlySet<ExecutionMode> = new Set([
+    "cell",
+    "range",
+    "all",
+    "from"
+  ])
   const useWarmKernel = (mode: ExecutionMode): boolean =>
-    warmKernel && kernelManager !== undefined && (mode === "all" || mode === "cell")
+    warmKernel && kernelManager !== undefined && WARM_KERNEL_MODES.has(mode)
 
   return {
     execute: (filePath, request) =>
@@ -381,16 +440,28 @@ const makeExecutionImpl = (
           }
         })
 
+        if (request.restart && useWarmKernel(request.mode) && kernelManager) {
+          // Fresh Python state: kill the live kernel; the next execute()
+          // respawns it with this request as the init payload.
+          yield* kernelManager.restart(abs)
+        }
+
         const startTs = Date.now()
         const useWarm = useWarmKernel(request.mode)
         const response = useWarm && kernelManager
-          ? yield* kernelManager.execute(abs, payload, { pythonPath: probe.pythonPath, helperPath })
+          ? yield* kernelManager.execute(
+              abs,
+              payload,
+              { pythonPath: probe.pythonPath, helperPath },
+              { abortSignal: request.abortSignal }
+            )
           : yield* runPython(
               probe.pythonPath,
               helperPath,
               payload,
               request.workingDirectory,
-              request.timeoutMs
+              request.timeoutMs,
+              request.abortSignal
             )
         const durationMs = Date.now() - startTs
         const truncated = truncateRunResponse(response, request.maxOutputChars)

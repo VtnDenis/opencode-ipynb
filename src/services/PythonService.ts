@@ -330,6 +330,12 @@ export interface KernelRuntimeOptions {
   readonly helperPath: string
 }
 
+export interface KernelExecuteOptions {
+  /** Session abort signal (V2 tool context). On abort the request is dropped
+   *  and the kernel is killed so the next run starts from a clean state. */
+  readonly abortSignal?: AbortSignal | undefined
+}
+
 export interface KernelInfo {
   readonly filePath: string
   readonly pid: number
@@ -507,7 +513,11 @@ export const makeKernelManager = (opts: KernelManagerOptions): KernelManagerShap
       state.pending.delete(id)
       clearTimeout(handler.timer)
       handler.cleanup?.()
-      if (m.error) {
+      // A structured runner response (success flag + error envelope) is data:
+      // it carries the per-cell summaries the TS side persists, and the
+      // kernel is intentionally left running. Only a bare error payload
+      // (no response shape) is a protocol-level failure.
+      if (m.error && typeof m.success !== "boolean") {
         if (typeof m.error !== "object" || m.error === null) {
           handler.reject(
             new PythonRunnerError({
@@ -731,7 +741,8 @@ export const makeKernelManager = (opts: KernelManagerOptions): KernelManagerShap
   const execute = (
     filePath: string,
     request: RunRequest,
-    runtime?: KernelRuntimeOptions
+    runtime?: KernelRuntimeOptions,
+    options?: KernelExecuteOptions
   ): Effect.Effect<RunResponse, NotebookError> =>
     Effect.gen(function* () {
       const state = yield* Effect.tryPromise({
@@ -755,32 +766,65 @@ export const makeKernelManager = (opts: KernelManagerOptions): KernelManagerShap
       const id = state.nextId++
       const timeoutMs = request.timeoutMs ?? opts.defaultTimeoutMs
       const raw = yield* Effect.tryPromise<RunResponse, PythonRunnerError>({
-        try: () =>
-          new Promise<RunResponse>((resolve, reject) => {
-            const timer = setTimeout(() => {
-              const handler = state.pending.get(id)
-              handler?.cleanup?.()
+        try: (signal) => {
+          return new Promise<RunResponse>((resolve, reject) => {
+            const abortSignal = options?.abortSignal
+            const combined = abortSignal ? AbortSignal.any([signal, abortSignal]) : signal
+            let settled = false
+            let cleanupStdinError: (() => void) | undefined
+            const cleanupListeners = (): void => {
+              combined.removeEventListener("abort", onAbort)
+              cleanupStdinError?.()
+            }
+            const settle = (fn: () => void): void => {
+              if (settled) return
+              settled = true
+              clearTimeout(timer)
+              cleanupListeners()
+              fn()
+            }
+            // Abort and timeout both leave the kernel busy with a request we
+            // no longer track (abort: the cell may keep running; timeout: it
+            // usually is). Kill it so the next run does not inherit a stuck
+            // kernel or time out in a cascade.
+            const onAbort = (): void => {
               state.pending.delete(id)
-              reject(
-                new PythonRunnerError({
-                  message: `warm kernel request timed out after ${timeoutMs}ms`,
-                  detail: `filePath=${filePath} id=${id}`
-                })
+              void killKernel(filePath)
+              settle(() =>
+                reject(
+                  new PythonRunnerError({
+                    message: "warm kernel request aborted",
+                    detail: `filePath=${filePath} id=${id}`
+                  })
+                )
+              )
+            }
+            const timer = setTimeout(() => {
+              state.pending.delete(id)
+              void killKernel(filePath)
+              settle(() =>
+                reject(
+                  new PythonRunnerError({
+                    message: `warm kernel request timed out after ${timeoutMs}ms`,
+                    detail: `filePath=${filePath} id=${id}`
+                  })
+                )
               )
             }, timeoutMs)
             state.pending.set(id, {
-              resolve: (r) => {
-                cleanupStdinError?.()
-                resolve(r)
-              },
-              reject: (e) => {
-                cleanupStdinError?.()
-                reject(e)
-              },
+              resolve: (r) => settle(() => resolve(r)),
+              reject: (e) => settle(() => reject(e)),
               timer,
-              cleanup: () => cleanupStdinError?.()
+              cleanup: () => {
+                clearTimeout(timer)
+                cleanupListeners()
+              }
             })
-            let cleanupStdinError: (() => void) | undefined
+            if (combined.aborted) {
+              onAbort()
+              return
+            }
+            combined.addEventListener("abort", onAbort, { once: true })
             try {
               const payload = JSON.stringify({ id, ...request }) + "\n"
               // Guard against a closed stdin before writing. If the kernel
@@ -790,12 +834,13 @@ export const makeKernelManager = (opts: KernelManagerOptions): KernelManagerShap
               const stdin = state.proc.stdin
               if (!stdin || !stdin.writable) {
                 state.pending.delete(id)
-                clearTimeout(timer)
-                reject(
-                  new PythonRunnerError({
-                    message: "kernel stdin is closed",
-                    detail: `filePath=${filePath} id=${id}`
-                  })
+                settle(() =>
+                  reject(
+                    new PythonRunnerError({
+                      message: "kernel stdin is closed",
+                      detail: `filePath=${filePath} id=${id}`
+                    })
+                  )
                 )
                 return
               }
@@ -803,14 +848,14 @@ export const makeKernelManager = (opts: KernelManagerOptions): KernelManagerShap
               // is observed on the request and not as an uncaught
               // stream error that crashes the plugin.
               const onStdinError = (): void => {
-                cleanupStdinError?.()
                 state.pending.delete(id)
-                clearTimeout(timer)
-                reject(
-                  new PythonRunnerError({
-                    message: "kernel stdin is closed",
-                    detail: `filePath=${filePath} id=${id}`
-                  })
+                settle(() =>
+                  reject(
+                    new PythonRunnerError({
+                      message: "kernel stdin is closed",
+                      detail: `filePath=${filePath} id=${id}`
+                    })
+                  )
                 )
               }
               stdin.once("error", onStdinError)
@@ -821,17 +866,18 @@ export const makeKernelManager = (opts: KernelManagerOptions): KernelManagerShap
               // exception.
               stdin.write(payload)
             } catch (err) {
-              cleanupStdinError?.()
               state.pending.delete(id)
-              clearTimeout(timer)
-              reject(
-                new PythonRunnerError({
-                  message: "failed to write to warm kernel stdin",
-                  detail: err instanceof Error ? err.message : String(err)
-                })
+              settle(() =>
+                reject(
+                  new PythonRunnerError({
+                    message: "failed to write to warm kernel stdin",
+                    detail: err instanceof Error ? err.message : String(err)
+                  })
+                )
               )
             }
-          }),
+          })
+        },
         catch: (err) =>
           err instanceof PythonRunnerError
             ? err
@@ -849,17 +895,13 @@ export const makeKernelManager = (opts: KernelManagerOptions): KernelManagerShap
             .join("; ")
         })
       }
-      const response = parsed.data
-      if (!response.success && response.error) {
-        return yield* new PythonRunnerError({
-          message: `${response.error.ename}: ${response.error.evalue}`,
-          detail: response.error.traceback.slice(0, 5).join("\n")
-        })
-      }
+      // Cell execution errors are returned to the caller (they carry the
+      // per-cell outputs the TS side persists); only protocol/infra failures
+      // are turned into PythonRunnerError above.
       state.requestsHandled++
       state.lastUsed = Date.now()
       totalRequests++
-      return response
+      return parsed.data
     })
 
   const isRunning = (filePath: string): boolean => {
@@ -922,7 +964,8 @@ export interface KernelManagerShape {
   readonly execute: (
     filePath: string,
     request: RunRequest,
-    runtime?: KernelRuntimeOptions
+    runtime?: KernelRuntimeOptions,
+    options?: KernelExecuteOptions
   ) => Effect.Effect<RunResponse, NotebookError>
   readonly isRunning: (filePath: string) => boolean
   readonly list: () => ReadonlyArray<KernelInfo>

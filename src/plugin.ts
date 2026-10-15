@@ -1,4 +1,4 @@
-import { Plugin } from "@opencode/plugin"
+import { Plugin, Skill } from "@opencode/plugin"
 import { z } from "zod"
 import { ipynbInspectTool } from "./tools/inspect.js"
 import { ipynbReadTool } from "./tools/read.js"
@@ -13,7 +13,9 @@ import { ipynbExportTool } from "./tools/export.js"
 import { ipynbDoctorTool } from "./tools/doctor.js"
 import { ipynbReproTool } from "./tools/repro.js"
 import { ipynbKernelTool } from "./tools/kernel.js"
+import { ipynbSearchTool } from "./tools/search.js"
 import { parsePluginOptions } from "./plugin-options.js"
+import { IPYNB_SKILL } from "./skill-content.js"
 import { disposeSharedKernelManager } from "./services/index.js"
 import type { ToolContext as V1Context, ToolResult as V1Result, ToolDefinition } from "./v1compat.js"
 
@@ -103,6 +105,19 @@ export default Plugin.define({
       editor.add(adapt("ipynb_doctor", ipynbDoctorTool, env) as never)
       editor.add(adapt("ipynb_repro", ipynbReproTool, env) as never)
       editor.add(adapt("ipynb_kernel", ipynbKernelTool, env, { permission: "edit" }) as never)
+      editor.add(adapt("ipynb_search", ipynbSearchTool, env) as never)
+    })
+    // Teach agents to use the ipynb_* tools instead of raw read/edit on
+    // notebook JSON (SKILL.md at the plugin root mirrors this content).
+    await ctx.skill.transform((editor) => {
+      editor.add({
+        id: Skill.ID.make(IPYNB_SKILL.id),
+        name: Skill.Name.make(IPYNB_SKILL.name),
+        description: IPYNB_SKILL.description,
+        autoinvoke: IPYNB_SKILL.autoinvoke,
+        path: IPYNB_SKILL.path as Skill.Info["path"],
+        content: IPYNB_SKILL.content
+      })
     })
     return async () => {
       // Kill every live warm kernel so we do not leave zombie Python

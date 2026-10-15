@@ -9,14 +9,19 @@ import { DEFAULT_MAX_EXPORT_CHARS } from "../utils/limits.js"
 const args = {
   filePath: z.string().describe("Absolute or relative path to the .ipynb file"),
   format: z
-    .enum(["markdown", "python", "summary"])
-    .describe("Export format: markdown, python, or summary"),
-  includeOutputs: z.boolean().optional().default(false).describe("For markdown: include outputs"),
+    .enum(["markdown", "python", "summary", "html"])
+    .describe("Export format: markdown, python, html (standalone document), or summary"),
+  includeOutputs: z
+    .boolean()
+    .optional()
+    .describe(
+      "Include cell outputs: markdown/python/summary default to false, html defaults to true (a standalone document without outputs is rarely useful)"
+    ),
   includeErrors: z
     .boolean()
     .optional()
     .default(true)
-    .describe("For markdown: include error tracebacks (default: true)"),
+    .describe("For markdown/html: include error tracebacks (default: true)"),
   outputPath: z
     .string()
     .optional()
@@ -25,15 +30,16 @@ const args = {
 
 export const ipynbExportTool = tool({
   description:
-    "Export a Jupyter Notebook to markdown, python, or a textual summary. Optionally write the result to a file (after permission).",
+    "Export a Jupyter Notebook to markdown, python, html, or a textual summary. The html format is a standalone document (inline styles, images as data: URIs, no external resources). Optionally write the result to a file (after permission).",
   args,
   async execute(input: z.infer<z.ZodObject<typeof args>>, context: ToolContext) {
     const services = buildServices(context)
     try {
+      const includeOutputs = input.includeOutputs ?? (input.format === "html")
       const result = await Effect.runPromise(
         services.export.export(input.filePath, {
           format: input.format,
-          includeOutputs: input.includeOutputs ?? false,
+          includeOutputs,
           includeErrors: input.includeErrors ?? true,
           outputPath: input.outputPath,
           maxExportChars: DEFAULT_MAX_EXPORT_CHARS

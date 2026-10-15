@@ -11,11 +11,12 @@ import {
 import { NotebookFileService, type NotebookFileServiceShape } from "./NotebookFileService.js"
 import { PathService, type PathServiceShape } from "./PathService.js"
 import { PermissionService, type PermissionServiceShape } from "./PermissionService.js"
-import { formatOutputs, type OutputFormatOptions } from "../format/outputs.js"
-import { DEFAULT_MAX_OUTPUT_CHARS } from "../utils/limits.js"
+import { formatOutputs, formatOutputsDetailed, type OutputFormatOptions } from "../format/outputs.js"
+import { DEFAULT_MAX_OUTPUT_CHARS, DEFAULT_MAX_IMAGE_NOTICE_COUNT } from "../utils/limits.js"
 import type { CellRaw, CodeCellRaw } from "../domain/cell.js"
 import { cellSource } from "../domain/notebook.js"
 import { unwrapFiberFailure } from "../utils/fiber.js"
+import type { ToolAttachment } from "../v1compat.js"
 
 export type OutputOperation = "list" | "read" | "read_error" | "clear_cell" | "clear_all"
 
@@ -47,6 +48,7 @@ export interface OutputReadResult {
   readonly cellIndex: number
   readonly rendered: string
   readonly outputCount: number
+  readonly attachments: ReadonlyArray<ToolAttachment>
 }
 
 export interface OutputErrorResult {
@@ -269,16 +271,32 @@ const makeOutputImpl = (
           displayPath: pathSvc.toDisplay(abs),
           cellIndex: idx,
           rendered: "(cell is not a code cell, no outputs)",
-          outputCount: 0
+          outputCount: 0,
+          attachments: []
         }
       }
       const code = cell as CodeCellRaw
-      const rendered = formatOutputs(code, baseOpts({ includeImages: request.includeImages, maxOutputChars: request.maxOutputChars }))
+      const formatted = yield* Effect.promise(() =>
+        formatOutputsDetailed(
+          code,
+          baseOpts({ includeImages: request.includeImages, maxOutputChars: request.maxOutputChars })
+        )
+      )
+      // Same mechanism as ipynb_read (base64 data: attachments). Cap the number
+      // of image attachments at DEFAULT_MAX_IMAGE_NOTICE_COUNT so a cell full of
+      // plots cannot blow up the model context.
+      const attachments = formatted.attachments.slice(0, DEFAULT_MAX_IMAGE_NOTICE_COUNT)
+      const omitted = formatted.attachments.length - attachments.length
+      const rendered =
+        omitted > 0
+          ? `${formatted.rendered}\n\n... (omitted ${omitted} additional image(s); at most ${DEFAULT_MAX_IMAGE_NOTICE_COUNT} image attachments are returned per read)`
+          : formatted.rendered
       return {
         displayPath: pathSvc.toDisplay(abs),
         cellIndex: idx,
         rendered,
-        outputCount: code.outputs.length
+        outputCount: code.outputs.length,
+        attachments
       }
     }),
   readError: (filePath, cellIndex) =>
