@@ -2,7 +2,7 @@
 
 A community [OpenCode](https://opencode.ai) plugin that adds robust support for Jupyter Notebook (`.ipynb`) files: inspect, read, edit, run, outputs, clean, export, reproducibility reports, and warm Python kernels.
 
-The plugin is **opt-in**, distributed via npm, and does not modify the OpenCode core. It exposes thirteen agent tools that operate on `.ipynb` files with explicit permissions, granular context control, and a strongly-typed [Effect](https://effect.website) runtime internally.
+The plugin is **opt-in**, distributed via npm, and does not modify the OpenCode core. It exposes fourteen agent tools that operate on `.ipynb` files with explicit permissions, granular context control, and a strongly-typed [Effect](https://effect.website) runtime internally.
 
 > Repository: https://github.com/Restodecoca/opencode-ipynb
 > Issues: https://github.com/Restodecoca/opencode-ipynb/issues
@@ -54,10 +54,11 @@ Then add `"opencode-ipynb"` (or the local path) to your `opencode.json`.
 | `ipynb_cell_insert`  | Insert a code/markdown/raw cell before or after a target index. |
 | `ipynb_cell_delete`  | Delete one cell by index and return a preview of the deleted source. |
 | `ipynb_cell_move`    | Move one cell to a new index. |
+| `ipynb_search`       | Search cell sources and/or outputs by text or regex, with cell/line locations and size limits. |
 | `ipynb_run`          | Execute one cell, a range, from a cell, or a full notebook via the Python helper. Supports save-to-notebook and optional warm kernels. |
 | `ipynb_outputs`      | List / read / read_error / clear_cell / clear_all outputs with pagination and permission gates for writes. |
 | `ipynb_clean`        | Strip outputs, execution counts, widget state, large images, and normalize `source` arrays for Git-friendly diffs. |
-| `ipynb_export`       | Export to Markdown, Python, or summary; optionally write to disk after permission. |
+| `ipynb_export`       | Export to Markdown, Python, summary, or standalone HTML (inline styles, images as data URIs); optionally write to disk after permission. |
 | `ipynb_doctor`       | Diagnose Python, helper discovery, and required Jupyter dependencies. |
 | `ipynb_repro`        | Reproducibility report: kernel/env info, `pip freeze`, filesystem reads, random seeds, non-determinism, missing packages. |
 | `ipynb_kernel`       | Inspect/restart/shutdown warm kernels when `ipynb.warmKernel: true` is enabled. |
@@ -116,8 +117,8 @@ ipynb_export({
 
 ## Safety and permissions
 
-- Every write (`ipynb_edit`, `ipynb_clean`, `ipynb_outputs clear_*`, `ipynb_export --outputPath`) calls `context.ask` before touching the disk.
-- Every execution (`ipynb_run`) calls `context.ask` with rich metadata: file path, mode (`cell` / `range` / `all` / `from`), cell range, save flag, working directory, timeout.
+- In OpenCode V2, each tool call goes through the agent approval flow, and the plugin tags writes with the `edit` permission and `ipynb_run` with the `shell` permission. Configure `permissions` in `opencode.json` to allow, ask, or deny them per tool (`ipynb_edit`, `ipynb_run`, `ipynb_clean`, ...).
+- `ipynb_run` receives rich execution metadata: file path, mode (`cell` / `range` / `all` / `from`), cell range, save flag, working directory, timeout.
 - `PathService` rejects paths that resolve outside of the OpenCode worktree. The lock manager serializes per-file writes to prevent accidental corruption.
 - The Python execution helper is an opt-in, isolated subprocess; it does not auto-install Jupyter. The user installs `python/requirements.txt` only when they want real execution.
 
@@ -214,7 +215,7 @@ It reports the selected interpreter, every Jupyter dependency (`[ok]` / `[missin
 ## Known limitations
 
 - Python execution depends on the user's local Python/Jupyter environment. The plugin diagnoses missing packages but never installs them.
-- Warm kernels are intentionally limited to `ipynb_run mode=all` and `mode=cell`; `range`, `from`, and `env` use one-shot helper processes.
+- Warm kernels cover every execution mode (`cell`, `range`, `from`, `all`) when `warmKernel` is enabled; `env` uses one-shot helper processes.
 - Large notebooks and rich outputs are truncated in tool responses to protect context. When `ipynb_run save=true`, full nbformat outputs are preserved on disk.
 - `allowOutsideWorktree` is a power-user escape hatch. Keep it disabled unless you explicitly need cross-worktree notebook access.
 
@@ -239,10 +240,10 @@ The published npm tarball contains only the runtime: `dist/`, `python/ipynb_runn
 Cut a release by tagging the commit and pushing the tag, then publish it on GitHub — the workflow runs only on the `published` release event:
 
 ```bash
-git tag v0.1.0 && git push --tags
+git tag v0.2.0 && git push --tags
 ```
 
-Then create a GitHub release at https://github.com/Restodecoca/opencode-ipynb/releases/new pointing at `v0.1.0`. The CI runs `bun run typecheck`, `bun test`, and `bun run build` before `npm publish --provenance --access public`. The repository must have a single secret configured: `NPM_TOKEN` (an npm automation token with publish rights for the package name in `package.json`).
+Then create a GitHub release at https://github.com/Restodecoca/opencode-ipynb/releases/new pointing at `v0.2.0`. The CI runs `bun run typecheck`, `bun test`, and `bun run build` before `npm publish --provenance --access public`. The repository must have a single secret configured: `NPM_TOKEN` (an npm automation token with publish rights for the package name in `package.json`).
 
 Before publishing, run a local package check:
 
@@ -311,7 +312,7 @@ Layout:
 ```
 src/
   index.ts                # re-exports the plugin
-  plugin.ts               # Plugin object, registers all 13 tools
+  plugin.ts               # Plugin object, registers all 14 tools
   domain/                 # zod schemas + types for cells, outputs, execution
   services/               # Effect-style services (Path, Permission, File, ...)
   format/                 # markdown / output / diagnostic / export formatters
